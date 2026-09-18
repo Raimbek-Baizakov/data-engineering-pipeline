@@ -1,30 +1,193 @@
 import csv
+import logging
+import os
+import re
+import time
 from pathlib import Path
 
 import psycopg2
+from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 CSV_FILE = BASE_DIR / "data" / "customers.csv"
 
+REJECTED_FILE = BASE_DIR / "data" / "rejected_customers.csv"
+
+load_dotenv(BASE_DIR / ".env")
 
 DB_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 5433,
-    "database": "analytics",
-    "user": "postgres",
-    "password": "1234",
+    "host": os.getenv("DB_HOST"),
+    "port": os.getenv("DB_PORT"),
+    "database": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
 }
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+
 def extract():
+    logger.info("Extract started")
+    if not CSV_FILE.exists():
+        raise FileNotFoundError(
+            f"CSV file not found {CSV_FILE}"
+        )
     with open(CSV_FILE, "r", encoding="utf-8") as file:
         reader = csv.DictReader(file)
-        return list(reader)
+        rows = list(reader)
 
+    logger.info(
+        "Extract completed: %d rows",
+        len(rows)
+    )
+
+    return rows
+
+
+REQUIRED_FIELDS = [
+    "first_name",
+    "last_name",
+    "email",
+    "age",
+    "city",
+]
+
+EMAIL_PATTERN = re.compile(
+    r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+)
+
+
+def validate(rows):
+    logger.info("Validation started")
+
+    valid_rows = []
+    rejected_rows = []
+
+    for row_number, row in enumerate(rows, start=2):
+        errors = []
+
+        for field in REQUIRED_FIELDS:
+            value = row.get(field)
+
+            if value is None or not value.strip():
+                errors.append(f"{field} is empty")
+
+        email = row.get("email", "").strip().lower()
+
+        if email and not EMAIL_PATTERN.match(email):
+            errors.append("invalid email")
+
+        age = row.get("age", "").strip()
+
+        try:
+            age_value = int(age)
+
+            if not 0 <= age_value <= 120:
+                errors.append("age out of range")
+
+        except ValueError:
+            errors.append("age is not an integer")
+
+        if errors:
+            rejected_rows.append(
+                {
+                    "row_number": row_number,
+                    "first_name": row.get("first_name", ""),
+                    "last_name": row.get("last_name", ""),
+                    "email": row.get("email", ""),
+                    "age": row.get("age", ""),
+                    "city": row.get("city", ""),
+                    "error": "; ".join(errors),
+                }
+            )
+
+            logger.warning(
+                "Row %d rejected: %s",
+                row_number,
+                ", ".join(errors),
+            )
+
+            continue
+
+        valid_rows.append(row)
+
+    logger.info(
+        "Validation completed: %d valid, %d invalid",
+        len(valid_rows),
+        len(rejected_rows),
+    )
+
+    return valid_rows, rejected_rows
+
+def save_rejected(rows):
+    if not rows:
+        logger.info("No rejected rows")
+
+
+        with open(
+            REJECTED_FILE,
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=[
+                    "row_number",
+                    "first_name",
+                    "last_name",
+                    "email",
+                    "age",
+                    "city",
+                    "error",
+                ],
+            )
+
+            writer.writeheader()
+
+        return
+
+    logger.info(
+        "Saving %d rejected rows to %s",
+        len(rows),
+        REJECTED_FILE,
+    )
+
+    with open(
+        REJECTED_FILE,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "row_number",
+                "first_name",
+                "last_name",
+                "email",
+                "age",
+                "city",
+                "error",
+            ],
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info("Rejected rows saved")
 
 def transform(rows):
+    logger.info("Transform started")
+
     transformed = []
 
     for row in rows:
@@ -46,62 +209,104 @@ def transform(rows):
                 "city": city,
             }
         )
+    logger.info(
+        "Transform completed: %d rows",
+        len(transformed)
+    )
 
     return transformed
 
 
 def load(rows):
-    connection = psycopg2.connect(**DB_CONFIG)
-    cursor = connection.cursor()
 
-    query = """
-        INSERT INTO customers (
-            first_name,
-            last_name,
-            email,
-            age,
-            city
+    logger.info("Load started")
+
+    connection = None
+    cursor = None
+
+    try:
+        connection = psycopg2.connect(**DB_CONFIG)
+
+        cursor = connection.cursor()
+
+        query = """
+            INSERT INTO customers (
+                first_name,
+                last_name,
+                email,
+                age,
+                city
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (email)
+            DO UPDATE SET
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                age = EXCLUDED.age,
+                city = EXCLUDED.city;
+        """
+
+        for row in rows:
+            cursor.execute(
+                query,
+                (
+                    row["first_name"],
+                    row["last_name"],
+                    row["email"],
+                    row["age"],
+                    row["city"],
+                ),
+            )
+
+        connection.commit()
+        logger.info(
+            "Load completed: %d rows",
+            len(rows)
         )
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (email)
-        DO UPDATE SET
-            first_name = EXCLUDED.first_name,
-            last_name = EXCLUDED.last_name,
-            age = EXCLUDED.age,
-            city = EXCLUDED.city;
-    """
+    except Exception:
+        if connection:
+            connection.rollback()
 
-    for row in rows:
-        cursor.execute(
-            query,
-            (
-                row["first_name"],
-                row["last_name"],
-                row["email"],
-                row["age"],
-                row["city"],
-            ),
-        )
+        logger.exception("Load failed")
 
-    connection.commit()
+        raise
 
-    cursor.close()
-    connection.close()
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
 
 
 def main():
-    print("Extract...")
-    rows = extract()
-    print(f"Получено записей: {len(rows)}")
+    start_time = time.perf_counter()
+    logger.info("ETL pipeline started")
 
-    print("Transform...")
-    rows = transform(rows)
+    try:
+        rows = extract()
 
-    print("Load...")
-    load(rows)
+        rows, rejected_rows = validate(rows)
 
-    print("ETL успешно завершён!")
+        save_rejected(rejected_rows)
 
+        rows = transform(rows)
+
+        load(rows)
+
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            "ETL pipeline completed successfully "
+            "in %.2f seconds",
+            elapsed,
+        )
+    except Exception:
+        elapsed = time.perf_counter() - start_time
+        logger.error(
+            "ETL pipeline failed after %.2f seconds",
+            elapsed,
+        )
+        raise
 
 if __name__ == "__main__":
     main()

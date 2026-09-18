@@ -1,0 +1,4 @@
+row_number,first_name,last_name,email,age,city,error
+7,Test,User,test,abc,Almaty,invalid email; age is not an integer
+8,Bad,Email,bad-email,25,Almaty,invalid email
+9,Wrong,Age,wrong@gmail.com,150,Almaty,age out of range
